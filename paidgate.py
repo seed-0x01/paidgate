@@ -19,6 +19,7 @@ PYTHONPATH). The x402 SDK / eth-account are used only by test.py, never here.
 """
 import base64
 import datetime
+import ipaddress
 import json
 import os
 import sys
@@ -32,16 +33,25 @@ CHAIN = "base"
 CHAIN_ID = 8453
 USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # native USDC, Base
 PAY_TO = "0x663952620CEeF96C9Ebe9B5002Cc5910A7CD8FFd"
-AMOUNT = "1000000"          # 1.00 USDC (6 decimals)
+AMOUNT = "50000"            # $0.05 USDC (6 decimals) — introductory price for the
+                            # first outside buyer. Why not $1.00: the only machine
+                            # buyer channel that exists (agent402's router) caps an
+                            # UNPROVEN seller at $0.05/call on Base, so a $1 price is
+                            # reachable only by a direct buyer I do not have yet. The
+                            # price rises to $1.00 after the first settled payment
+                            # from a payer who is not me — stated here, not implied.
 MAX_TIMEOUT = 300           # seconds; the offer's validity window
 MAX_HEADER = 8192           # refuse oversized PAYMENT-SIGNATURE headers
 RESOURCE_PATH = "/paid/swapcheck"
 LEDGER = "/opt/data/projects/paidgate/settlements.jsonl"
+HITS = "/opt/data/projects/paidgate/hits.jsonl"
 TOKEN_NAME = "USD Coin"
 TOKEN_VERSION = "2"
 DESCRIPTION = ("Fresh signed swap-sanity report: live Uniswap V3 quotes on Base, "
                "every route ranked after gas, EIP-191 signed by Tallow's wallet. "
-               "Read-only; no trade executed. Autonomous AI agent service.")
+               "Read-only; no trade executed. Autonomous AI agent service. "
+               "Introductory price: 0.05 USDC, rising to 1.00 USDC after the first "
+               "settled payment from an outside payer.")
 
 
 def now_iso():
@@ -56,6 +66,39 @@ def b64e(obj):
 def b64d(text):
     raw = base64.b64decode(text.encode("ascii"), validate=True).decode("utf-8")
     return json.loads(raw)
+
+
+def _bazaar():
+    """Self-description carried in the 402 so a Bazaar-conformant crawler can
+    list this route from the challenge alone (shape: docs.x402.org/extensions/bazaar).
+
+    Without this block a directory sees a 402 with a price but no idea what the
+    endpoint returns, so no buyer is ever routed to it. The example below is the
+    envelope's real shape (swapcheck-envelope/1), not a plausible invention.
+    """
+    return {
+        "bazaar": {
+            "info": {
+                "input": {"type": "http", "method": "GET"},
+                "output": {
+                    "type": "json",
+                    "example": {
+                        "schema": "swapcheck-envelope/1",
+                        "payload": {
+                            "schema": "swapcheck/1",
+                            "chain": "base",
+                            "pairs": [{
+                                "asset": "WETH", "target": "USDC",
+                                "routes": [{"fee": "500", "net": "…"}],
+                            }],
+                        },
+                        "signature": "0x…",
+                        "signed_by": PAY_TO,
+                    },
+                },
+            }
+        }
+    }
 
 
 def offer(host=None):
@@ -82,6 +125,7 @@ def offer(host=None):
             "maxTimeoutSeconds": MAX_TIMEOUT,
             "extra": {"name": TOKEN_NAME, "version": TOKEN_VERSION},
         }],
+        "extensions": _bazaar(),
     }
 
 
@@ -228,11 +272,57 @@ def _send(handler, code, body, extra=None):
     handler.wfile.write(raw)
 
 
+def _ip_class(ip):
+    """Coarse client IP class only — never persist a raw address in telemetry."""
+    try:
+        a = ipaddress.ip_address(str(ip))
+        if a.is_loopback:
+            return "loopback"
+        if a.is_private:
+            return "private"
+        if a.is_link_local:
+            return "link-local"
+        if a.is_reserved or a.is_multicast or a.is_unspecified:
+            return "special"
+        return "public"
+    except Exception:  # noqa: BLE001 - a bad address is still a countable hit
+        return "unknown"
+
+
+def _hit(handler, event, detail=""):
+    """Emit exactly ONE telemetry line per paid-route request.
+
+    Landlord decision 2026-11-23: every paid endpoint reports UTC, path, UA,
+    paid-or-402 and client IP class, so "nobody came" becomes a countable
+    deletion instead of a guess. No raw IP, no body, no key. Telemetry must
+    never break the sale, hence the blanket guard.
+    """
+    try:
+        raw = handler.headers.get("PAYMENT-SIGNATURE") or handler.headers.get("X-PAYMENT")
+        rec = {
+            "ts": now_iso(),
+            "path": getattr(handler, "_pg_path", RESOURCE_PATH),
+            "method": getattr(handler, "_pg_method", "GET"),
+            "ua": str(handler.headers.get("User-Agent", ""))[:120],
+            "paid_or_402": "paid" if raw else "402",
+            "ip_class": _ip_class(handler.client_address[0] if handler.client_address else ""),
+            "event": event,
+            "detail": str(detail)[:200],
+        }
+        with open(HITS, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    except Exception:  # noqa: BLE001 - telemetry must never break the sale
+        pass
+
+
 def handle(handler, method, path):
     """Return True if this request was for the paid resource and was answered."""
     if path.split("?", 1)[0] != RESOURCE_PATH:
         return False
+    handler._pg_path = path.split("?", 1)[0]
+    handler._pg_method = method
     if method != "GET":
+        _hit(handler, "405", "method not allowed")
         _send(handler, 405, {"error": "GET only"})
         return True
 
@@ -243,6 +333,7 @@ def handle(handler, method, path):
     if not raw:
         # No payment: a standards-shaped 402. Body is a human-readable copy;
         # the base64 PAYMENT-REQUIRED header is what an x402 client parses.
+        _hit(handler, "402", "no payment header")
         _send(handler, 402,
               {"x402Message": "Payment required. See PAYMENT-REQUIRED header.",
                "offer": pr},
@@ -250,6 +341,7 @@ def handle(handler, method, path):
         return True
 
     if len(raw) > MAX_HEADER:
+        _hit(handler, "402", "payment header too large")
         _send(handler, 402, {"error": "payment header too large"},
               {"PAYMENT-REQUIRED": b64e(pr)})
         return True
@@ -257,6 +349,7 @@ def handle(handler, method, path):
     try:
         payload = b64d(raw)
     except Exception:  # noqa: BLE001
+        _hit(handler, "402", "malformed base64 payment header")
         _send(handler, 402,
               {"error": "malformed base64 payment header"},
               {"PAYMENT-REQUIRED": b64e(pr)})
@@ -264,6 +357,7 @@ def handle(handler, method, path):
 
     version = payload.get("x402Version")
     if version != 2:
+        _hit(handler, "402", "x402 version %r" % version)
         _send(handler, 402,
               {"error": "x402 v2 required (got %r); v1 legacy is not accepted" % version},
               {"PAYMENT-REQUIRED": b64e(pr)})
@@ -271,6 +365,7 @@ def handle(handler, method, path):
 
     ok, why = terms_ok(payload.get("accepted"))
     if not ok:
+        _hit(handler, "attempt_rejected", why)
         _send(handler, 402, {"error": why}, {"PAYMENT-REQUIRED": b64e(pr)})
         return True
 
@@ -282,6 +377,8 @@ def handle(handler, method, path):
     }
     vres, vcode = post("/verify", verify_body)
     if not vres.get("isValid"):
+        _hit(handler, "402_verify_failed",
+             str(vres.get("invalidReason") or vres.get("error") or "")[:80])
         _send(handler, 402,
               {"error": "payment not verified by facilitator",
                "reason": vres.get("invalidReason") or vres.get("error") or vres,
@@ -293,12 +390,14 @@ def handle(handler, method, path):
     try:
         report = fresh_report()
     except Exception as e:  # noqa: BLE001
+        _hit(handler, "502_report", type(e).__name__ + ": " + str(e)[:80])
         _send(handler, 502, {"error": "report generation failed; payment NOT settled",
                              "detail": type(e).__name__ + ": " + str(e)[:200]})
         return True
 
     sres, scode = post("/settle", verify_body)
     if not sres.get("success"):
+        _hit(handler, "502_settle", str(sres.get("error") or "")[:80])
         _send(handler, 502,
               {"error": "facilitator settle failed",
                "reason": sres.get("error") or sres,
@@ -321,6 +420,7 @@ def handle(handler, method, path):
         "report_signature": report["signature"],
     }
     log_settlement(receipt)
+    _hit(handler, "200", "settled " + str(receipt.get("txHash", ""))[:60])
     _send(handler, 200,
           {"schema": "paidgate-receipt/1", "receipt": receipt, "resource": report},
           {"PAYMENT-RESPONSE": b64e(sres)})
