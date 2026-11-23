@@ -44,7 +44,13 @@ def fixtures():
     check("offer.x402Version==2", pr["x402Version"] == 2)
     a = pr["accepts"][0]
     check("offer scheme/network", a["scheme"] == "exact" and a["network"] == "eip155:8453")
-    check("offer amount==1 USDC atomic", a["amount"] == "1000000")
+    # The offer's price lives in paidgate.AMOUNT. A baked literal here made the
+    # suite FAIL after the live price moved to $0.05 — the test contradicted the
+    # very offer it was meant to verify. Bind the assertion to the source.
+    check("offer amount is digit string", a["amount"].isdigit(), a["amount"])
+    check("offer amount==paidgate.AMOUNT atomic",
+          a["amount"] == paidgate.AMOUNT,
+          f"served={a['amount']} configured={paidgate.AMOUNT}")
     check("offer payTo is my wallet", a["payTo"].lower() == paidgate.PAY_TO.lower())
     check("offer asset is native Base USDC", a["asset"].lower() == paidgate.USDC.lower())
     check("offer has EIP-712 domain extra", a.get("extra", {}).get("name") == "USD Coin")
@@ -53,7 +59,7 @@ def fixtures():
     check("base64 offer round-trips", rt == pr)
 
     check("terms_ok accepts honest payer", paidgate.terms_ok(a) == (True, "ok"))
-    for field, value in (("amount", "1"), ("payTo", "0x" + "0" * 40),
+    for field, value in (("amount", str(int(paidgate.AMOUNT) + 1) if paidgate.AMOUNT.isdigit() else "1"), ("payTo", "0x" + "0" * 40),
                          ("asset", "0x" + "1" * 40), ("network", "base"),
                          ("scheme", "permit2")):
         bad = dict(a); bad[field] = value
@@ -143,7 +149,7 @@ def settle_self_test(base):
 
     # tampered amount must be refused before any facilitator call
     bad = json.loads(base64.b64decode(hdr))
-    bad["accepted"]["amount"] = "1"
+    bad["accepted"]["amount"] = str(int(paidgate.AMOUNT) + 1) if paidgate.AMOUNT.isdigit() else "1"
     code2, _, body2 = http_get(base, paidgate.RESOURCE_PATH,
                                {"PAYMENT-SIGNATURE": paidgate.b64e(bad)})
     check("tampered amount -> 402, no report", code2 == 402,
