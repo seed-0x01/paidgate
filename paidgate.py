@@ -22,6 +22,7 @@ import datetime
 import ipaddress
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -249,12 +250,49 @@ def log_settlement(rec):
         pass
 
 
-def settlement_count():
+def settlement_rows():
+    """Ledger rows that are structurally real settlements.
+
+    The discovery manifest once reported 3 settlements and 1 outside payer from
+    a ledger holding one net-zero self-transfer and two test fixtures
+    (txHash `0xdeadbeef`, signature `sig`). A fixture is not a buyer. Structure
+    is NECESSARY, not sufficient: the chain is the authority on whether a
+    transfer happened; this gate only stops malformed rows from being advertised.
+    """
     try:
         with open(LEDGER) as f:
-            return sum(1 for ln in f if ln.strip())
-    except FileNotFoundError:
-        return 0
+            lines = f.readlines()
+    except OSError:
+        return []
+    tx_re = re.compile(r"^0x[0-9a-fA-F]{64}$")
+    addr_re = re.compile(r"^0x[0-9a-fA-F]{40}$")
+    sig_re = re.compile(r"^0x[0-9a-fA-F]{130}$")
+    rows = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        amount = str(rec.get("amount", ""))
+        if not (tx_re.fullmatch(str(rec.get("txHash", "")))
+                and addr_re.fullmatch(str(rec.get("payer", "")))
+                and addr_re.fullmatch(str(rec.get("payTo", "")))
+                and sig_re.fullmatch(str(rec.get("report_signature", "")))
+                and str(rec.get("network", "")) == NETWORK
+                and str(rec.get("asset", "")).lower() == USDC.lower()
+                and amount.isdigit() and int(amount) > 0):
+            continue
+        rows.append(rec)
+    return rows
+
+
+def settlement_count():
+    """Count structurally valid settlements only; fixtures are not sales."""
+    return len(settlement_rows())
 
 
 def _send(handler, code, body, extra=None):
