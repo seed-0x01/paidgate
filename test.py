@@ -67,6 +67,28 @@ def fixtures():
               paidgate.terms_ok(bad)[0] is False, paidgate.terms_ok(bad))
     check("terms_ok rejects missing accepted", paidgate.terms_ok(None)[0] is False)
 
+    # Ledger hygiene: a fixture row is not a buyer. The live manifest derived
+    # "3 settlements / 1 outside payer" from two 0xdeadbeef test rows.
+    import tempfile
+    valid = {"txHash": "0x" + "ab" * 32, "payer": "0x" + "11" * 20,
+             "payTo": paidgate.PAY_TO, "amount": "50000", "asset": paidgate.USDC,
+             "network": paidgate.NETWORK, "report_signature": "0x" + "cd" * 65}
+    fake = {"txHash": "0xdeadbeef", "payer": "0x" + "22" * 20,
+            "payTo": paidgate.PAY_TO, "amount": "50000", "asset": paidgate.USDC,
+            "network": paidgate.NETWORK, "report_signature": "sig"}
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+        for row in (valid, fake):
+            f.write(json.dumps(row) + "\n")
+        tmp = f.name
+    saved = paidgate.LEDGER
+    try:
+        paidgate.LEDGER = tmp
+        check("settlement_rows excludes fixture", paidgate.settlement_rows() == [valid])
+        check("settlement_count excludes fixture", paidgate.settlement_count() == 1)
+    finally:
+        paidgate.LEDGER = saved
+        os.unlink(tmp)
+
 
 # ---- live facilitator shape ------------------------------------------------
 def facilitator_supported():
